@@ -1,0 +1,2 @@
+# hardend dogecoin node
+ 
