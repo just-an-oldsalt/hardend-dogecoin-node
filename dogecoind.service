@@ -5,7 +5,10 @@
 
 [Unit]
 Description=Dogecoin daemon
-After=network.target
+Documentation=https://github.com/dogecoin/dogecoin
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/opt/dogecoin-1.14.6/bin/dogecoind -daemon \
@@ -16,14 +19,32 @@ ExecStart=/opt/dogecoin-1.14.6/bin/dogecoind -daemon \
 # Make sure the config directory is readable by the service user
 PermissionsStartOnly=true
 ExecStartPre=/bin/chgrp dogegroup /etc/dogecoin
+ExecStartPre=/bin/mkdir -p /mnt/data/doge
+ExecStartPre=/bin/chown dogeuser:dogegroup /mnt/data/doge
 
 # Process management
 ####################
 
 Type=forking
 PIDFile=/run/dogecoind/dogecoind.pid
-Restart=on-failure
+Restart=always
+RestartSec=10
 TimeoutStopSec=600
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Resource limits
+####################
+
+# Limit memory usage (adjust based on your system)
+MemoryMax=4G
+MemoryHigh=3G
+
+# Limit CPU usage
+CPUQuota=200%
+
+# Limit number of file descriptors
+LimitNOFILE=65536
 
 # Directory creation and permissions
 ####################################
@@ -43,6 +64,13 @@ ConfigurationDirectoryMode=0710
 # /var/lib/dogecoind
 StateDirectory=dogecoind
 StateDirectoryMode=0710
+
+# Logging configuration
+####################
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=dogecoind
 
 # Hardening measures
 ####################
@@ -66,6 +94,74 @@ PrivateDevices=true
 
 # Deny the creation of writable and executable memory mappings.
 MemoryDenyWriteExecute=true
+
+# Additional security measures
+####################
+
+# Restrict the process from changing the system clock
+ProtectClock=true
+
+# Restrict the process from changing the system hostname
+ProtectHostname=true
+
+# Restrict the process from changing the system timezone
+ProtectTimezone=true
+
+# Restrict the process from changing the system locale
+ProtectLocale=true
+
+# Restrict the process from changing the system machine ID
+ProtectMachineId=true
+
+# Restrict the process from changing the system control groups
+ProtectControlGroups=true
+
+# Restrict the process from changing the system kernel modules
+ProtectKernelModules=true
+
+# Restrict the process from changing the system kernel tunables
+ProtectKernelTunables=true
+
+# Restrict the process from changing the system kernel logs
+ProtectKernelLogs=true
+
+# Restrict the process from changing the system kernel keys
+ProtectKernelKeys=true
+
+# Restrict the process from changing the system kernel variables
+ProtectKernelVariables=true
+
+# Restrict the process from changing the system kernel parameters
+ProtectKernelParameters=true
+
+# Restrict the process from changing the system kernel capabilities
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+# Restrict the process from changing the system kernel namespaces
+LockPersonality=true
+
+# Restrict the process from changing the system kernel security
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Restrict the process from changing the system kernel memory
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Restrict the process from changing the system kernel network
+RestrictNetworkInterfaces=lo
+
+# Restrict the process from changing the system kernel processes
+RestrictProc=ptraceable
+
+# Restrict the process from changing the system kernel signals
+RestrictSignals=SIGKILL SIGSTOP SIGTERM SIGINT
+
+# Restrict the process from changing the system kernel syscalls
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target
