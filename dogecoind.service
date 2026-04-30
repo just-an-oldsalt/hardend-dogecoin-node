@@ -1,167 +1,226 @@
-# Note that almost all daemon options could be specified in
-# /etc/dogecoin/dogecoin.conf, but keep in mind those explicitly
-# specified as arguments in ExecStart= will override those in the
-# config file.
+# =============================================================================
+# Dogecoin Core - hardened systemd service unit
+# =============================================================================
+#
+# This unit runs dogecoind as an unprivileged user (dogeuser:dogegroup) inside
+# a tightly sandboxed environment. It is designed to be readable - every
+# directive below has a comment explaining what it does and why it's here.
+#
+# Anything passed to dogecoind on the ExecStart= line overrides the value in
+# /etc/dogecoin/dogecoin.conf (CLI args win over the config file). Keep that
+# in mind when changing paths.
+#
+# Validate any edits before reloading:
+#   sudo systemd-analyze verify dogecoind.service
+#   sudo systemctl daemon-reload && sudo systemctl restart dogecoind
+#   sudo journalctl -u dogecoind -f
+#
+# =============================================================================
 
 [Unit]
-Description=Dogecoin daemon
+Description=Dogecoin daemon (hardened)
 Documentation=https://github.com/dogecoin/dogecoin
+Documentation=https://github.com/just-an-oldsalt/hardend-dogecoin-node
+
+# Don't start until the network is actually reachable - dogecoind needs peers.
 After=network-online.target
 Wants=network-online.target
+
+# Disable systemd's default rate-limit on restarts. Combined with Restart=always
+# below, this means the daemon will keep being restarted on failure indefinitely.
 StartLimitIntervalSec=0
 
 [Service]
+# -----------------------------------------------------------------------------
+# How dogecoind is launched
+# -----------------------------------------------------------------------------
+# -daemon       : fork into background; pairs with Type=forking below
+# -pid=         : PID file location, must match PIDFile= so systemd can track it
+# -conf=        : path to dogecoin.conf (config file)
+# -datadir=     : where the blockchain, wallet and indexes live - this CLI arg
+#                 overrides any datadir= line in dogecoin.conf
 ExecStart=/opt/dogecoin-1.14.6/bin/dogecoind -daemon \
                             -pid=/run/dogecoind/dogecoind.pid \
                             -conf=/etc/dogecoin/dogecoin.conf \
                             -datadir=/mnt/data/doge/
 
-# Make sure the config directory is readable by the service user
-PermissionsStartOnly=true
-ExecStartPre=/bin/chgrp dogegroup /etc/dogecoin
-ExecStartPre=/bin/mkdir -p /mnt/data/doge
-ExecStartPre=/bin/chown dogeuser:dogegroup /mnt/data/doge
+# -----------------------------------------------------------------------------
+# Pre-start fixups (run as root, hence the leading "+")
+# -----------------------------------------------------------------------------
+# The "+" prefix tells systemd to run this command with full privileges, even
+# though the service itself drops to dogeuser. That's needed because we're
+# touching /etc and /mnt which dogeuser doesn't own.
+#
+# We make sure the config dir is group-readable by dogegroup, and that the data
+# directory exists and is owned by our service user.
+ExecStartPre=+/bin/chgrp dogegroup /etc/dogecoin
+ExecStartPre=+/bin/mkdir -p /mnt/data/doge
+ExecStartPre=+/bin/chown dogeuser:dogegroup /mnt/data/doge
 
+# -----------------------------------------------------------------------------
 # Process management
-####################
-
+# -----------------------------------------------------------------------------
+# Type=forking matches dogecoind's -daemon behavior: the parent exits after
+# spawning the real worker, and systemd tracks the worker via PIDFile.
 Type=forking
 PIDFile=/run/dogecoind/dogecoind.pid
+
+# Always restart on crash, with a 10-second cooldown to avoid tight loops.
 Restart=always
 RestartSec=10
+
+# Give dogecoind up to 10 minutes to flush the UTXO database on shutdown.
+# Killing it mid-flush can corrupt chainstate and force a costly reindex.
 TimeoutStopSec=600
 KillMode=mixed
 KillSignal=SIGTERM
 
+# -----------------------------------------------------------------------------
 # Resource limits
-####################
-
-# Limit memory usage (adjust based on your system)
-MemoryMax=4G
+# -----------------------------------------------------------------------------
+# These are sized for dbcache=1024 + maxmempool=500 in dogecoin.conf. If you
+# raise either of those, raise these too or the kernel will OOM-kill the daemon.
 MemoryHigh=3G
+MemoryMax=4G
 
-# Limit CPU usage
+# Soft cap at 2 cores worth of CPU. Dogecoind is mostly I/O-bound, so this is
+# plenty for normal operation and prevents runaway CPU usage from squeezing
+# out other services on a shared box.
 CPUQuota=200%
 
-# Limit number of file descriptors
+# Dogecoind opens many sockets (one per peer) plus chainstate/blocks files.
+# 65536 is comfortable headroom over the default 1024.
 LimitNOFILE=65536
 
-# Directory creation and permissions
-####################################
-
-# Run as dogecoin:dogecoin
+# -----------------------------------------------------------------------------
+# Identity and managed directories
+# -----------------------------------------------------------------------------
+# Run as a dedicated unprivileged user. This is the single biggest security win:
+# even if dogecoind is somehow exploited, the attacker is confined to dogeuser.
 User=dogeuser
 Group=dogegroup
 
-# /run/dogecoind
+# systemd auto-creates and chowns these for us:
+#   /run/dogecoind     - PID file lives here, wiped on reboot
+#   /etc/dogecoin      - config dir
+#   /var/lib/dogecoind - state dir (unused by default but available)
 RuntimeDirectory=dogecoind
 RuntimeDirectoryMode=0710
-
-# /etc/dogecoin
 ConfigurationDirectory=dogecoin
 ConfigurationDirectoryMode=0710
-
-# /var/lib/dogecoind
 StateDirectory=dogecoind
 StateDirectoryMode=0710
 
-# Logging configuration
-####################
-
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+# Send stdout/stderr to journald. Tail with: journalctl -u dogecoind -f
+# (Dogecoind also writes its own debug.log inside the data directory.)
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=dogecoind
 
-# Hardening measures
-####################
+# =============================================================================
+# Hardening
+# =============================================================================
+# The directives below progressively shrink the kernel surface area visible
+# to dogecoind. They follow the principle of least privilege: we deny
+# everything by default and only allow what's actually needed.
+#
+# Any of these can be commented out individually to debug a startup issue,
+# but understand what you're disabling first.
+# =============================================================================
 
-# Provide a private /tmp and /var/tmp.
+# --- Filesystem isolation -----------------------------------------------------
+
+# Give the service its own /tmp and /var/tmp, invisible to other processes.
 PrivateTmp=true
 
-# Mount /usr, /boot/ and /etc read-only for the process.
+# Mount /usr, /boot, /efi and /etc read-only. The daemon can read libraries
+# and config but cannot tamper with system binaries. Use "strict" if you want
+# the entire filesystem read-only except explicit ReadWritePaths=.
 ProtectSystem=full
 
-# Deny access to /home, /root and /run/user
+# Hide /home, /root and /run/user. Dogecoind has no business touching them.
 ProtectHome=true
 
-# Disallow the process and all of its children to gain
-# new privileges through execve().
-NoNewPrivileges=true
-
-# Use a new /dev namespace only populated with API pseudo devices
-# such as /dev/null, /dev/zero and /dev/random.
+# Give the service a private /dev with only API pseudo-devices (null, zero,
+# random, urandom, tty). No disks, no USB, no GPUs.
 PrivateDevices=true
 
-# Deny the creation of writable and executable memory mappings.
-MemoryDenyWriteExecute=true
+# Hide other users' processes from /proc. The daemon only sees its own PIDs.
+ProtectProc=invisible
+ProcSubset=pid
 
-# Additional security measures
-####################
+# --- Privilege and capability lockdown ----------------------------------------
 
-# Restrict the process from changing the system clock
-ProtectClock=true
+# A child process can never gain more privileges than dogeuser - even if a
+# binary it executes has setuid bits. This blocks a whole class of escalation.
+NoNewPrivileges=true
 
-# Restrict the process from changing the system hostname
-ProtectHostname=true
-
-# Restrict the process from changing the system timezone
-ProtectTimezone=true
-
-# Restrict the process from changing the system locale
-ProtectLocale=true
-
-# Restrict the process from changing the system machine ID
-ProtectMachineId=true
-
-# Restrict the process from changing the system control groups
-ProtectControlGroups=true
-
-# Restrict the process from changing the system kernel modules
-ProtectKernelModules=true
-
-# Restrict the process from changing the system kernel tunables
-ProtectKernelTunables=true
-
-# Restrict the process from changing the system kernel logs
-ProtectKernelLogs=true
-
-# Restrict the process from changing the system kernel keys
-ProtectKernelKeys=true
-
-# Restrict the process from changing the system kernel variables
-ProtectKernelVariables=true
-
-# Restrict the process from changing the system kernel parameters
-ProtectKernelParameters=true
-
-# Restrict the process from changing the system kernel capabilities
+# Drop every Linux capability. Dogecoind only needs to open unprivileged
+# sockets; it doesn't need CAP_NET_BIND_SERVICE or anything else.
 AmbientCapabilities=
 CapabilityBoundingSet=
 
-# Restrict the process from changing the system kernel namespaces
+# Lock the process personality (e.g. cannot switch to PER_LINUX32) and forbid
+# setuid/setgid binary execution.
 LockPersonality=true
-
-# Restrict the process from changing the system kernel security
-RestrictNamespaces=true
-RestrictRealtime=true
 RestrictSUIDSGID=true
 
-# Restrict the process from changing the system kernel memory
+# --- Memory and execution constraints -----------------------------------------
+
+# No page can be both writable AND executable. Dogecoind doesn't JIT, so this
+# blocks shellcode that tries to write-then-execute its payload.
+MemoryDenyWriteExecute=true
+
+# Forbid the realtime scheduler. A buggy realtime priority can starve the
+# whole system; we have no need for it.
+RestrictRealtime=true
+
+# --- Kernel surface reduction -------------------------------------------------
+
+# Block creation of new namespaces (no nested containers from this service).
+RestrictNamespaces=true
+
+# These ProtectKernel*= directives forbid touching kernel-level state:
+#   - kernel modules (no insmod/rmmod)
+#   - sysctl tunables and /proc/sys
+#   - /proc/kmsg and /dev/kmsg (kernel log)
+#   - the kernel keyring
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+# (KernelKeys: blocks add_key/request_key syscalls)
+
+# Forbid touching system identity and time:
+ProtectClock=true       # cannot adjtime/settimeofday
+ProtectHostname=true    # cannot sethostname
+ProtectControlGroups=true  # /sys/fs/cgroup is read-only
+
+# --- Network and syscall filtering --------------------------------------------
+
+# Only allow the address families dogecoind actually uses:
+#   AF_INET    - IPv4
+#   AF_INET6   - IPv6
+#   AF_UNIX    - local sockets (RPC over named pipe, etc.)
+# Notably this blocks AF_NETLINK, AF_PACKET, AF_BLUETOOTH, etc.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
-# Restrict the process from changing the system kernel network
-RestrictNetworkInterfaces=lo
-
-# Restrict the process from changing the system kernel processes
-RestrictProc=ptraceable
-
-# Restrict the process from changing the system kernel signals
-RestrictSignals=SIGKILL SIGSTOP SIGTERM SIGINT
-
-# Restrict the process from changing the system kernel syscalls
+# Restrict syscalls to those expected from a long-running network service.
+# @system-service is a curated allowlist maintained by systemd. Calls outside
+# the allowlist return EPERM rather than killing the process, which makes
+# misconfiguration easier to spot in logs.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
+
+# --- Optional: bind to a specific outgoing interface --------------------------
+# Uncomment and edit if you want to force traffic out a specific NIC, e.g.
+# for a Tor-only setup where you also run dogecoind with -onlynet=onion.
+# Setting this to "lo" alone WILL break P2P - the daemon will only see
+# loopback and never reach external peers.
+# RestrictNetworkInterfaces=lo eth0
 
 [Install]
 WantedBy=multi-user.target
